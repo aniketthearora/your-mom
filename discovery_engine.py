@@ -20,13 +20,21 @@ precision of the company -> official website association is not:
     4. A persistent registry stops the same companies being re-exported by
        every run over the same query universe.
 
+The registry records handoffs that finished, not companies the engine meant
+to hand over. An entry is created only after prospector_input.csv has been
+replaced on disk, and only an entry in that state can hold a company back
+from a later run. So the two files can only ever disagree in one direction:
+an interrupted run may hand a company over again next time, but it can never
+suppress one that no CSV ever carried. Work in progress lives in the
+autosave, which is what a resumed run exports from.
+
 Outputs (written to the directory containing this file):
     master_company_list.xlsx  - accepted companies, review queue, rejects
     prospector_input.csv      - exactly two columns: Company Name, Website
     run_report.xlsx           - run statistics and per-source diagnostics
     discovery.log             - detailed runtime log
     discovery_autosave.json   - checkpoint for resume support
-    discovery_registry.json   - cross-run registry of discovered companies
+    discovery_registry.json   - companies handed over by completed exports
 
 Usage:
     python discovery_engine.py
@@ -82,7 +90,15 @@ OUTPUT_RUN_REPORT = BASE_DIR / "run_report.xlsx"
 # diagnostics and the consecutive-block counters. Older autosaves are ignored
 # by the existing version check rather than being misread.
 AUTOSAVE_VERSION = 4
-REGISTRY_VERSION = 1
+
+# Bumped for the durability fix: entries now carry the export state that
+# earns them the right to suppress a future discovery. Version 1 registries
+# are migrated on load rather than discarded.
+REGISTRY_VERSION = 2
+
+# An entry only suppresses future discoveries once the company it names has
+# actually been written to prospector_input.csv.
+REGISTRY_STATUS_EXPORTED = "exported"
 
 SEARCH_KEYWORDS = [
     "Performance Marketing Agency",
@@ -916,6 +932,20 @@ class DiscoveryRegistry:
     two unrelated agencies can share a name, so a name match only counts as
     a duplicate when it comes from the same directory as the earlier one.
 
+    The file records completed handoffs, not intentions. An entry is created
+    only by commit_exported(), which runs after prospector_input.csv has been
+    replaced on disk, so a company can only be suppressed once it has really
+    crossed the boundary into the Intelligence Engine's input. Everything a
+    run does to the registry before that - refreshing timestamps, noting
+    aliases - stays in memory and is persisted by the same commit.
+
+    That ordering decides how the two failure modes play out. A crash before
+    the commit loses this run's registry updates, and the companies are
+    rediscovered next time. A crash between the CSV replace and the commit
+    does the same. Neither can suppress a company that was never handed over,
+    which is the direction that matters: a rediscovery costs one profile
+    fetch, a wrongly suppressed company is gone from every future run.
+
     Nothing here needs a database. The file is small - one entry per exported
     company - and is rewritten atomically so an interrupted run cannot leave
     a half-written registry behind.
@@ -946,7 +976,12 @@ class DiscoveryRegistry:
             LOGGER.warning("Ignoring unreadable discovery registry: %s", error)
             return
 
-        if not isinstance(payload, dict) or payload.get("version") != REGISTRY_VERSION:
+        if not isinstance(payload, dict):
+            LOGGER.warning("Ignoring discovery registry with an unexpected shape.")
+            return
+
+        version = payload.get("version")
+        if version not in (1, REGISTRY_VERSION):
             LOGGER.warning("Ignoring discovery registry from an incompatible version.")
             return
 
@@ -957,76 +992,152 @@ class DiscoveryRegistry:
 
         for domain, entry in companies.items():
             if isinstance(domain, str) and domain and isinstance(entry, dict):
+                # Version 1 predates the export state. Its entries were
+                # written once a company had been accepted, which for any run
+                # that reached its export step is the same set - so they are
+                # carried over as exported rather than thrown away.
+                entry.setdefault("status", REGISTRY_STATUS_EXPORTED)
                 self.entries[domain] = entry
 
         self.loaded_count = len(self.entries)
+
+        if version == 1:
+            LOGGER.warning(
+                "Discovery registry upgraded from version 1: %d entries adopted as "
+                "already exported. Any company a crashed v1 run recorded without "
+                "handing over stays suppressed; delete %s to rediscover them.",
+                self.loaded_count, self.path.name,
+            )
+
         LOGGER.info(
             "Discovery registry loaded: %d companies from earlier runs (mode=%s).",
             self.loaded_count, self.mode,
         )
 
+    @staticmethod
+    def suppresses(entry: dict | None) -> bool:
+        """True when an entry has earned the right to hold back a rediscovery."""
+        return bool(entry) and entry.get("status") == REGISTRY_STATUS_EXPORTED
+
     def lookup(self, domain: str) -> dict | None:
-        """Return the stored entry for a root domain, if there is one."""
-        return self.entries.get(domain) if domain else None
+        """Return the exported entry for a root domain, if there is one."""
+        if not domain:
+            return None
+
+        entry = self.entries.get(domain)
+        if self.suppresses(entry):
+            return entry
+
+        # An alias is a second address for a company that was exported under
+        # a different domain, so it suppresses through that company's entry.
+        for candidate in self.entries.values():
+            if self.suppresses(candidate) and domain in candidate.get("aliases", []):
+                return candidate
+
+        return None
 
     def find_by_name(self, normalized: str, source: str) -> dict | None:
         """
         Secondary lookup: the same normalized name from the same directory.
 
         Name alone is never enough - this pairs it with the source so two
-        different agencies that happen to share a name are not merged.
+        different agencies that happen to share a name are not merged. The
+        entry it returns is always one that was exported, so a company held
+        back by this route is held back by a handoff that really happened.
         """
         if not normalized:
             return None
 
         for entry in self.entries.values():
+            if not self.suppresses(entry):
+                continue
             if entry.get("normalized_name") == normalized and entry.get("source") == source:
                 return entry
 
         return None
 
     def knows(self, domain: str, normalized_name: str, source: str) -> dict | None:
-        """Return the matching entry when this company has been seen before."""
+        """Return the matching exported entry when this company is not new."""
         return self.lookup(domain) or self.find_by_name(normalized_name, source)
 
-    def remember(self, record: CompanyRecord, timestamp: str) -> None:
-        """Record a newly exported company, or refresh one already stored."""
-        domain = record.root_domain
-        if not domain:
-            return
+    def commit_exported(self, records: list[CompanyRecord], timestamp: str) -> int:
+        """
+        Record the companies a completed export actually handed over.
 
-        existing = self.entries.get(domain)
+        This is the only way an entry is created, and it is called after
+        prospector_input.csv is in place, so the registry can never suppress
+        a company that was not handed over. Returns how many entries are new.
+        """
+        before = self.added_count
 
-        if existing is None:
-            self.entries[domain] = {
-                "domain": domain,
-                "company_name": record.company_name,
-                "normalized_name": normalized_company_name(record.company_name),
-                "source": record.source,
-                "source_url": record.source_url,
-                "website": record.website,
-                "first_discovered_at": record.discovered_at or timestamp,
-                "last_seen_at": timestamp,
-                "times_seen": 1,
-            }
-            self.added_count += 1
-            return
+        for record in records:
+            domain = record.root_domain
+            if not domain:
+                continue
 
-        existing["last_seen_at"] = timestamp
-        existing["times_seen"] = int(existing.get("times_seen", 1)) + 1
-        existing.setdefault("company_name", record.company_name)
-        existing.setdefault("normalized_name", normalized_company_name(record.company_name))
-        existing.setdefault("source", record.source)
-        existing.setdefault("source_url", record.source_url)
-        existing.setdefault("website", record.website)
-        existing.setdefault("first_discovered_at", record.discovered_at or timestamp)
-        self.updated_count += 1
+            existing = self.entries.get(domain)
 
-    def touch(self, entry: dict, timestamp: str) -> None:
-        """Note that a already-known company was met again this run."""
+            if existing is None:
+                self.entries[domain] = {
+                    "domain": domain,
+                    "company_name": record.company_name,
+                    "normalized_name": normalized_company_name(record.company_name),
+                    "source": record.source,
+                    "source_url": record.source_url,
+                    "website": record.website,
+                    "status": REGISTRY_STATUS_EXPORTED,
+                    "first_discovered_at": record.discovered_at or timestamp,
+                    "first_exported_at": timestamp,
+                    "last_exported_at": timestamp,
+                    "last_seen_at": timestamp,
+                    "times_seen": 1,
+                    "aliases": [],
+                }
+                self.added_count += 1
+                continue
+
+            # Re-exporting a company already on file (a resumed run writes its
+            # restored records again, and fresh mode rediscovers everything)
+            # refreshes the entry. times_seen belongs to note_seen_again(), so
+            # a second export of the same row does not inflate it.
+            existing["status"] = REGISTRY_STATUS_EXPORTED
+            existing["last_exported_at"] = timestamp
+            existing["last_seen_at"] = timestamp
+            existing.setdefault("first_exported_at", timestamp)
+            existing.setdefault("aliases", [])
+            existing.setdefault("company_name", record.company_name)
+            existing.setdefault("normalized_name", normalized_company_name(record.company_name))
+            existing.setdefault("source", record.source)
+            existing.setdefault("source_url", record.source_url)
+            existing.setdefault("website", record.website)
+            existing.setdefault("first_discovered_at", record.discovered_at or timestamp)
+            self.updated_count += 1
+
+        return self.added_count - before
+
+    def note_seen_again(self, entry: dict, timestamp: str, alias: str = "") -> None:
+        """
+        Note that an exported company turned up again in this run.
+
+        Held in memory until the commit, like every other change a run makes,
+        so an interrupted run cannot leave the registry ahead of the CSV. An
+        alias is the other domain the company was found under: recording it
+        keeps the reason a later run skips that domain visible in the file
+        rather than recomputed from a name match every time.
+        """
         entry["last_seen_at"] = timestamp
         entry["times_seen"] = int(entry.get("times_seen", 1)) + 1
         self.updated_count += 1
+
+        if alias and alias != entry.get("domain"):
+            aliases = entry.setdefault("aliases", [])
+            if alias not in aliases:
+                aliases.append(alias)
+                LOGGER.info(
+                    "Recorded %s as another address for %s (exported %s).",
+                    alias, entry.get("company_name", "?"),
+                    entry.get("first_exported_at", "unknown"),
+                )
 
     def save(self) -> None:
         """Write the registry atomically so a crash cannot corrupt it."""
@@ -2648,12 +2759,15 @@ def review_record(runtime: Runtime, record: CompanyRecord, reason: str) -> None:
 
 def registry_gate(runtime: Runtime, record: CompanyRecord) -> bool:
     """
-    Stop a company earlier runs already discovered from being processed again.
+    Stop a company earlier runs already handed over from being processed again.
 
     Returns True when the candidate was recognised and should go no further.
     The company is still written to the audit workbook and its registry entry
     is refreshed, so nothing is lost - it simply does not reach
     prospector_input.csv a second time.
+
+    Only entries that were actually exported can gate anything, so a run that
+    was interrupted before its export cannot hide a company from later runs.
 
     In fresh mode the registry is consulted for logging only, so the whole
     universe can be deliberately rediscovered.
@@ -2678,7 +2792,7 @@ def registry_gate(runtime: Runtime, record: CompanyRecord) -> bool:
         return False
 
     timestamp = datetime.now().isoformat(timespec="seconds")
-    registry.touch(entry, timestamp)
+    registry.note_seen_again(entry, timestamp, alias=record.root_domain)
 
     runtime.registry_duplicates += 1
     note_source_event(runtime, record.source, EVENT_REGISTRY_DUPLICATES)
@@ -2780,12 +2894,17 @@ def checkpoint(runtime: Runtime) -> None:
         "known_companies": [asdict(company) for company in runtime.known_companies],
     }
 
+    # The registry is deliberately not written here. It records completed
+    # handoffs, and this run has not made one yet: the companies below are
+    # carried in the autosave instead, so a resumed run still exports them
+    # and a lost run rediscovers them. Writing the registry at a checkpoint
+    # is what let an interrupted run suppress a company it never handed over.
     save_autosave(state)
-    runtime.registry.save()
 
     LOGGER.info(
-        "Checkpoint saved at query %d (%d companies, %d in review).",
+        "Checkpoint saved at query %d (%d companies, %d in review, %d awaiting export).",
         runtime.query_index, runtime.companies_found, runtime.records_review,
+        runtime.companies_exported,
     )
 
 
@@ -3099,30 +3218,43 @@ def export_master(runtime: Runtime) -> None:
     )
 
 
-def export_prospector(runtime: Runtime) -> None:
+def export_prospector(runtime: Runtime) -> list[CompanyRecord]:
     """
     Write prospector_input.csv with exactly the two columns Engine 2 expects.
 
     The schema is frozen. Only accepted companies that are new to the
     registry are written: a record in the review queue, a rejected record and
     a company an earlier run already handed over all stay out.
+
+    The file is built beside its destination and moved into place, so a run
+    that dies mid-write leaves the previous handoff intact instead of a
+    truncated one. Returns the records that reached the file, which is what
+    the registry is then allowed to suppress.
     """
-    exported = 0
+    exported = [record for record in runtime.records if record.exported]
+    temporary = OUTPUT_PROSPECTOR.with_suffix(OUTPUT_PROSPECTOR.suffix + ".tmp")
 
-    with OUTPUT_PROSPECTOR.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(PROSPECTOR_COLUMNS)
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(PROSPECTOR_COLUMNS)
 
-        for record in runtime.records:
-            if not record.exported:
-                continue
-            writer.writerow([record.company_name, record.website])
-            exported += 1
+            for record in exported:
+                writer.writerow([record.company_name, record.website])
+
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.replace(temporary, OUTPUT_PROSPECTOR)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
 
     LOGGER.info(
         "Prospector input written to %s (%d companies).",
-        OUTPUT_PROSPECTOR.name, exported,
+        OUTPUT_PROSPECTOR.name, len(exported),
     )
+    return exported
 
 
 def create_run_report(runtime: Runtime, stats: dict) -> None:
@@ -3251,18 +3383,80 @@ def verify_statistics(runtime: Runtime, stats: dict) -> None:
         LOGGER.info("Statistics consistency checks passed.")
 
 
+def commit_registry(runtime: Runtime, handed_over: list[CompanyRecord]) -> None:
+    """
+    Close the loop: record what the export actually handed over, then save.
+
+    Called only once prospector_input.csv is on disk. Everything this run did
+    to the registry - the companies it exported, the refreshed timestamps,
+    the aliases it noted - reaches the file here or not at all, which is what
+    keeps the registry from ever running ahead of the handoff.
+    """
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    added = runtime.registry.commit_exported(handed_over, timestamp)
+
+    runtime.registry.save()
+
+    LOGGER.info(
+        "Registry committed after export: %d companies handed over, %d newly suppressed.",
+        len(handed_over), added,
+    )
+
+
+def verify_registry_consistency(runtime: Runtime, handed_over: list[CompanyRecord]) -> None:
+    """
+    Check the invariant the registry exists to hold, and log the result.
+
+    Every company this run handed over must now be suppressible, and nothing
+    may suppress without having been handed over at some point. The second
+    half is structural - commit_exported() is the only thing that creates an
+    entry - so it is asserted rather than assumed.
+    """
+    registry = runtime.registry
+    problems = []
+
+    for record in handed_over:
+        if not registry.suppresses(registry.entries.get(record.root_domain)):
+            problems.append(f"{record.company_name} ({record.root_domain}) was exported but is not registered")
+
+    unexported = [
+        domain for domain, entry in registry.entries.items()
+        if not registry.suppresses(entry)
+    ]
+    if unexported:
+        problems.append(f"{len(unexported)} registry entries would suppress without an export")
+
+    for problem in problems[:10]:
+        LOGGER.error("Registry inconsistency: %s", problem)
+
+    if not problems:
+        LOGGER.info(
+            "Registry consistency check passed: %d handed over, %d companies suppressed in total.",
+            len(handed_over), len(registry.entries),
+        )
+
+
 def finalize_run(runtime: Runtime) -> dict:
-    """Write every output file and print the summary. Records are already unique."""
+    """
+    Write every output file and print the summary. Records are already unique.
+
+    Order matters here. The handoff file is written first and the registry is
+    committed from what it actually contains, so the two can only disagree in
+    the safe direction - a company rediscovered next run, never one silently
+    dropped from every future handoff.
+    """
     stats = build_run_statistics(runtime)
     verify_statistics(runtime, stats)
 
     export_master(runtime)
-    export_prospector(runtime)
+
+    handed_over = export_prospector(runtime)
+    commit_registry(runtime, handed_over)
+    verify_registry_consistency(runtime, handed_over)
+
     create_run_report(runtime, stats)
     print_statistics(stats)
     print_source_diagnostics(runtime)
-
-    runtime.registry.save()
 
     LOGGER.info(
         "Discovery run completed with %d companies (%d exported, %d in review).",
@@ -3277,10 +3471,15 @@ def finalize_run(runtime: Runtime) -> dict:
 
 def register_accepted(runtime: Runtime, record: CompanyRecord) -> None:
     """
-    Decide whether an accepted company is new, and record it in the registry.
+    Decide whether an accepted company still needs handing over.
 
     The check is repeated here because following a redirect can change the
     root domain after the early registry gate has already run.
+
+    This marks the record for export; it does not put it in the registry.
+    Nothing is registered until the export has been written, so that being
+    interrupted here costs at most a rediscovery rather than losing a company
+    from every future handoff. commit_exported() closes the loop.
     """
     registry = runtime.registry
     timestamp = datetime.now().isoformat(timespec="seconds")
@@ -3294,15 +3493,13 @@ def register_accepted(runtime: Runtime, record: CompanyRecord) -> None:
     record.previously_discovered = entry is not None
     record.exported = not (registry.enforcing and record.previously_discovered)
 
-    if record.exported:
-        registry.remember(record, timestamp)
-    elif entry is not None:
-        registry.touch(entry, timestamp)
+    if entry is not None and not record.exported:
+        registry.note_seen_again(entry, timestamp, alias=record.root_domain)
         runtime.registry_duplicates += 1
         note_source_event(runtime, record.source, EVENT_REGISTRY_DUPLICATES)
         LOGGER.info(
-            "Accepted but held back from the export: %s is already in the registry.",
-            record.company_name,
+            "Accepted but held back from the export: %s was handed over on %s.",
+            record.company_name, entry.get("first_exported_at", "an earlier run"),
         )
 
 
