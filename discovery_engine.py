@@ -69,11 +69,18 @@ SEARCH_KEYWORDS = [
     "PPC Agency",
     "Growth Marketing Agency",
     "Media Buying Agency",
+    "Meta Ads Agency",
+    "Google Ads Agency",
+    "Media Buying Agency",
+    "Paid Social Agency",
 ]
 
 INDIAN_CITIES = [
     "Pune", "Mumbai", "Delhi", "Bangalore", "Hyderabad",
-    "Ahmedabad", "Chennai", "Kolkata", "Surat", "Jaipur",
+    "Ahmedabad", "Chennai", "Kolkata", "Surat", "Jaipur", 
+    "Indore", "Nagpur", "Kochi", "Coimbatore", "Chandigarh",
+    "Noida", "Gurgaon", "Bhubaneswar", "Mysore", "Vadodara",
+    "Lucknow", "Vizag", "Navi Mumbai", "Goa", "Thane",
 ]
 
 USER_AGENT = (
@@ -92,7 +99,7 @@ SLOW_MO_MS = 250
 PAGE_TIMEOUT_MS = 25_000
 VERIFY_TIMEOUT_SECONDS = 12
 
-MAX_RESULTS_PER_QUERY = 10
+MAX_RESULTS_PER_QUERY = 30
 MAX_INTERNAL_PAGES = 5
 MAX_META_DESCRIPTION_CHARS = 300
 MAX_RESPONSE_SNIFF_CHARS = 20_000
