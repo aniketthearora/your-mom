@@ -1,0 +1,41 @@
+/* Vibe: bold Y2K */
+.favorites {
+  font-family: 'Space Grotesk', sans-serif;
+  background: #ffe600;
+  color: #111;
+}
+
+.favorites h1 {
+  font-size: clamp(2rem, 8vw, 4rem);
+  text-transform: uppercase;
+}
+
+.favorites .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 20px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.favorites .card {
+  padding: 20px;
+  border: 3px solid #111;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 6px 6px 0 #111;
+}
+
+.favorites .card:nth-child(4n + 1) { background: #ff8ad8; }
+.favorites .card:nth-child(4n + 2) { background: #7df9ff; }
+.favorites .card:nth-child(4n + 3) { background: #b4ff6b; }
+
+.favorites h2 {
+  margin: 0 0 12px;
+}
+
+.favorites ul {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 1.1rem;
+}
